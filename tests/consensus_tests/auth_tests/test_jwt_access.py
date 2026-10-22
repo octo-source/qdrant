@@ -595,6 +595,8 @@ ACTION_ACCESS = {
     "get_locks": EndpointAccess(True, False, True, "GET /locks", coll_r=False),
     "get_issues": EndpointAccess(True, True, True, "GET /issues"),
     "clear_issues": EndpointAccess(False, False, True, "DELETE /issues"),
+    "get_logger_config": EndpointAccess(True, False, True, "GET /logger", coll_r=False),
+    "update_logger_config": EndpointAccess(False, False, True, "POST /logger"),
 }
 
 
@@ -1914,3 +1916,11 @@ def test_get_issues():
 
 def test_clear_issues():
     check_access("clear_issues")
+
+
+def test_get_logger_config():
+    check_access("get_logger_config")
+
+
+def test_update_logger_config():
+    check_access("update_logger_config", {})

@@ -311,6 +311,10 @@ service:
 
 cluster:
   # Use `enabled: true` to run Qdrant in distributed deployment mode
+  # Before enabling, restrict the P2P port to nodes of this same cluster.
+  # In this version the internal API shares service.host and does not check
+  # service.api_key or read_only_api_key. Public API access must not imply P2P
+  # access. See https://github.com/qdrant/qdrant/security/advisories/GHSA-frc7-44gm-99qq
   enabled: false
 
   # Configuration of the inter-cluster communication
