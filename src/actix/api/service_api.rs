@@ -179,26 +179,44 @@ fn kubernetes_healthz() -> impl Responder {
 }
 
 #[get("/logger")]
-async fn get_logger_config(handle: web::Data<tracing::LoggerHandle>) -> impl Responder {
+async fn get_logger_config(
+    ActixAccess(access): ActixAccess,
+    handle: web::Data<tracing::LoggerHandle>,
+) -> impl Responder {
     let timing = Instant::now();
-    let result = handle.get_config().await;
-    helpers::process_response(Ok(result), timing, None)
+
+    let future = async {
+        let _ = access.check_global_access(AccessRequirements::new())?;
+        let config = handle.get_config().await;
+        Ok(config)
+    };
+
+    helpers::process_response(future.await, timing, None)
 }
 
 #[post("/logger")]
 async fn update_logger_config(
+    ActixAccess(access): ActixAccess,
     handle: web::Data<tracing::LoggerHandle>,
-    config: web::Json<tracing::LoggerConfig>,
+    mut config: web::Json<tracing::LoggerConfig>,
 ) -> impl Responder {
     let timing = Instant::now();
 
-    let result = handle
-        .update_config(config.into_inner())
-        .await
-        .map(|_| true)
-        .map_err(|err| StorageError::service_error(err.to_string()));
+    let future = async {
+        let _ = access.check_global_access(AccessRequirements::new().manage())?;
 
-    helpers::process_response(result, timing, None)
+        // Log file can only be set in Qdrant config file
+        config.on_disk.log_file = None;
+
+        handle
+            .update_config(config.into_inner())
+            .await
+            .map_err(|err| StorageError::service_error(err.to_string()))?;
+
+        Ok(true)
+    };
+
+    helpers::process_response(future.await, timing, None)
 }
 
 // Configure services
@@ -213,4 +231,101 @@ pub fn config_service_api(cfg: &mut web::ServiceConfig) {
         .service(readyz)
         .service(get_logger_config)
         .service(update_logger_config);
+}
+
+#[cfg(test)]
+mod logger_security_tests {
+    use actix_web::{App, HttpMessage, test};
+    use serde_json::json;
+    use storage::rbac::{Access, CollectionAccessList};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::reload;
+
+    use super::*;
+
+    #[actix_web::test]
+    async fn logger_security_access_and_fixed_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let configured_path = directory.path().join("configured.log");
+        let requested_path = directory.path().join("untrusted.log");
+        let mut config = tracing::LoggerConfig::default();
+        config.on_disk.log_file = Some(configured_path.to_str().unwrap().to_owned());
+
+        // Retain a subscriber without changing process-global logging.
+        let (disk, disk_handle) =
+            reload::Layer::new(tracing::on_disk::new_logger(&mut config.on_disk));
+        let subscriber = tracing_subscriber::registry().with(disk);
+        let (default, default_handle) =
+            reload::Layer::new(tracing::default::new_logger(&config.default));
+        let _subscriber = subscriber.with(default);
+        let handle = tracing::LoggerHandle::new(config.clone(), default_handle, disk_handle);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(handle.clone()))
+                .service(get_logger_config)
+                .service(update_logger_config),
+        )
+        .await;
+
+        for access in [
+            Access::full_ro("test"),
+            Access::Collection(CollectionAccessList(vec![])),
+        ] {
+            let request = test::TestRequest::post()
+                .uri("/logger")
+                .set_json(json!({"on_disk": {"enabled": true, "log_file": requested_path}}))
+                .to_request();
+            request.extensions_mut().insert(access);
+            let response = test::call_service(&app, request).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(handle.get_config().await, config);
+            assert!(!requested_path.exists());
+            assert!(!configured_path.exists());
+        }
+
+        let request = test::TestRequest::get().uri("/logger").to_request();
+        request
+            .extensions_mut()
+            .insert(Access::Collection(CollectionAccessList(vec![])));
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let request = test::TestRequest::get().uri("/logger").to_request();
+        request.extensions_mut().insert(Access::full_ro("test"));
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::OK
+        );
+
+        let request = test::TestRequest::post()
+            .uri("/logger")
+            .set_json(json!({"on_disk": {"enabled": true, "log_file": requested_path}}))
+            .to_request();
+        request.extensions_mut().insert(Access::full("test"));
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::OK
+        );
+        let updated = handle.get_config().await;
+        assert_eq!(updated.on_disk.log_file, config.on_disk.log_file);
+        assert_eq!(updated.on_disk.enabled, Some(true));
+        assert!(configured_path.exists());
+        assert!(!requested_path.exists());
+
+        let request = test::TestRequest::post()
+            .uri("/logger")
+            .set_json(json!({"log_level": "warn", "on_disk": {"enabled": false}}))
+            .to_request();
+        request.extensions_mut().insert(Access::full("test"));
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            handle.get_config().await.default.log_level.as_deref(),
+            Some("warn")
+        );
+        assert_eq!(handle.get_config().await.on_disk.enabled, Some(false));
+    }
 }
